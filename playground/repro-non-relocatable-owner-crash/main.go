@@ -20,8 +20,8 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-// Package main reproduces stale named-actor ownership after the node hosting a
-// non-relocatable actor dies without running graceful ActorSystem shutdown.
+// Package main reproduces cluster lookup returning a named non-relocatable actor
+// from an endpoint that membership already knows has departed.
 package main
 
 import (
@@ -55,7 +55,6 @@ const (
 
 	peerWait       = 20 * time.Second
 	lookupWait     = 10 * time.Second
-	ownershipWait  = 12 * time.Second
 	operationLimit = time.Second
 )
 
@@ -158,50 +157,39 @@ func runSurvivor() {
 	waitForPeerCount(ctx, survivor, 0, peerWait)
 	fmt.Println("owner process killed; survivor membership now reports zero peers")
 
+	lookupBroken := false
+
 	lookupCtx, cancel := context.WithTimeout(ctx, operationLimit)
 	stalePID, lookupErr := survivor.ActorOf(lookupCtx, actorName)
 	cancel()
 	switch {
 	case lookupErr == nil && stalePID != nil:
-		fmt.Printf("ActorOf immediately after departure: %s (remote=%t)\n", stalePID.ID(), stalePID.IsRemote())
+		fmt.Printf("ActorOf after departure: %s (remote=%t)\n", stalePID.ID(), stalePID.IsRemote())
+		if stalePID.IsRemote() {
+			lookupBroken = true
+		}
 	default:
-		fmt.Printf("ActorOf immediately after departure: err=%v\n", lookupErr)
+		fmt.Printf("ActorOf after departure: err=%v\n", lookupErr)
 	}
 
-	released, lastErr := waitForActorAbsent(ctx, survivor, actorName, ownershipWait)
-	fmt.Printf("name became absent within %s: %t", ownershipWait, released)
-	if lastErr != nil {
-		fmt.Printf(" (last error: %v)", lastErr)
-	}
-	fmt.Println()
-
-	spawnCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	recreated, spawnErr := survivor.SpawnOn(
-		spawnCtx,
-		actorName,
-		&worker{},
-		actor.WithPlacement(actor.Local),
-		actor.WithRelocationDisabled(),
-	)
+	existsCtx, cancel := context.WithTimeout(ctx, operationLimit)
+	exists, existsErr := survivor.ActorExists(existsCtx, actorName)
 	cancel()
-
-	if spawnErr != nil {
-		fmt.Printf("recreate same name: err=%v\n", spawnErr)
+	if existsErr != nil {
+		fmt.Printf("ActorExists after departure: err=%v\n", existsErr)
 	} else {
-		fmt.Printf(
-			"recreate same name: %s (local=%t relocatable=%t)\n",
-			recreated.ID(),
-			recreated.IsLocal(),
-			recreated.IsRelocatable(),
-		)
+		fmt.Printf("ActorExists after departure: %t\n", exists)
+		if exists {
+			lookupBroken = true
+		}
 	}
 
-	if !released || spawnErr != nil || recreated == nil || !recreated.IsLocal() || recreated.IsRelocatable() {
-		fmt.Println("REPRO (broken): the dead non-relocatable actor still blocks clean reuse of its stable name")
+	if lookupBroken {
+		fmt.Println("REPRO (broken): lookup still reports an actor owned by a departed endpoint after membership reports zero peers")
 		os.Exit(1)
 	}
 
-	fmt.Println("OK: the dead incarnation no longer owns the name and a fresh non-relocatable actor can claim it")
+	fmt.Println("OK: lookup did not report an actor owned by the departed endpoint")
 }
 
 func runOwner() {
@@ -323,28 +311,6 @@ func waitForActor(ctx context.Context, system actor.ActorSystem, name string, ti
 
 	fatal("actor %q did not become visible within %s", name, timeout)
 	return nil
-}
-
-func waitForActorAbsent(ctx context.Context, system actor.ActorSystem, name string, timeout time.Duration) (bool, error) {
-	deadline := time.Now().Add(timeout)
-	var lastErr error
-
-	for time.Now().Before(deadline) {
-		lookupCtx, cancel := context.WithTimeout(ctx, operationLimit)
-		exists, err := system.ActorExists(lookupCtx, name)
-		cancel()
-
-		if err == nil && !exists {
-			return true, nil
-		}
-		if err != nil {
-			lastErr = err
-		}
-
-		time.Sleep(100 * time.Millisecond)
-	}
-
-	return false, lastErr
 }
 
 func mustEnvInt(name string) int {
