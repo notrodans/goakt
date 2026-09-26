@@ -2948,6 +2948,79 @@ func TestActorSystem(t *testing.T) {
 	})
 }
 
+func TestClusterLookupWaitsForDepartedOwnerResolution(t *testing.T) {
+	const (
+		peerAddress = "127.0.0.2:9000"
+		remotePort  = 7000
+		actorName   = "departed-owner"
+	)
+
+	t.Run("ActorExists does not return a departed owner", func(t *testing.T) {
+		clusterMock := mockscluster.NewCluster(t)
+		system := newReplicationSystem(clusterMock)
+		system.departedEndpoints.Set(address.FormatHostPort("127.0.0.2", remotePort), types.Unit{})
+
+		record := internalpb.Actor_builder{
+			Address:       address.New(actorName, system.name, "127.0.0.2", remotePort).String(),
+			IncarnationId: uuid.NewString(),
+		}.Build()
+		clusterMock.EXPECT().GetActor(mock.Anything, actorName).Return(record, nil).Once()
+		clusterMock.EXPECT().GetActor(mock.Anything, actorName).Return(nil, cluster.ErrActorNotFound).Once()
+
+		exists, err := system.ActorExists(context.Background(), actorName)
+		require.NoError(t, err)
+		assert.False(t, exists)
+	})
+
+	t.Run("initial timeout retries when cached membership shows a departure", func(t *testing.T) {
+		clusterMock := mockscluster.NewCluster(t)
+		system := newReplicationSystem(clusterMock)
+		system.peerRemotingPorts.Set(peerAddress, remotePort)
+
+		clusterMock.EXPECT().GetActor(mock.Anything, actorName).Return(nil, context.DeadlineExceeded).Once()
+		clusterMock.EXPECT().Peers(mock.Anything).Return(nil, nil).Once()
+		clusterMock.EXPECT().GetActor(mock.Anything, actorName).Return(nil, cluster.ErrActorNotFound).Once()
+
+		exists, err := system.ActorExists(context.Background(), actorName)
+		require.NoError(t, err)
+		assert.False(t, exists)
+	})
+
+	t.Run("timeout without departure evidence surfaces", func(t *testing.T) {
+		clusterMock := mockscluster.NewCluster(t)
+		system := newReplicationSystem(clusterMock)
+
+		clusterMock.EXPECT().GetActor(mock.Anything, actorName).Return(nil, context.DeadlineExceeded).Once()
+
+		exists, err := system.ActorExists(context.Background(), actorName)
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+		assert.False(t, exists)
+	})
+
+	t.Run("ActorOf keeps a live remote owner", func(t *testing.T) {
+		clusterMock := mockscluster.NewCluster(t)
+		system := newReplicationSystem(clusterMock)
+		system.peerRemotingPorts.Set(peerAddress, remotePort)
+
+		liveRecord := internalpb.Actor_builder{
+			Address:       address.New(actorName, system.name, "127.0.0.2", remotePort).String(),
+			IncarnationId: uuid.NewString(),
+		}.Build()
+
+		clusterMock.EXPECT().GetActor(mock.Anything, actorName).Return(liveRecord, nil).Once()
+		clusterMock.EXPECT().Peers(mock.Anything).Return([]*cluster.Peer{{
+			Host:         "127.0.0.2",
+			PeersPort:    9000,
+			RemotingPort: remotePort,
+		}}, nil).Once()
+
+		pid, err := system.ActorOf(context.Background(), actorName)
+		require.NoError(t, err)
+		require.NotNil(t, pid)
+		assert.True(t, pid.IsRemote())
+	})
+}
+
 func TestRemoteContextPropagation(t *testing.T) {
 	t.Run("RemoteAsk extracts context values", func(t *testing.T) {
 		ctxKey := remoteTestCtxKey{}

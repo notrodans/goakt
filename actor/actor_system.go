@@ -1164,6 +1164,12 @@ type actorSystem struct {
 	// for this.
 	relocatingEndpoints *xsync.TTLMap[string, types.Unit]
 
+	// departedEndpoints retains remoting endpoints of nodes that left long
+	// enough for registry lookup to recognize crash recovery after the shorter
+	// message-handoff window has closed. It carries no actor state and expires
+	// automatically.
+	departedEndpoints *xsync.TTLMap[string, types.Unit]
+
 	// recentDepartures records the peers addresses of nodes that left within the
 	// correlated-departure window, each retained for that window. It lets the
 	// registry repair-on-departure detect a correlated (multi-node) failure: at
@@ -1308,6 +1314,7 @@ func NewActorSystem(name string, opts ...Option) (ActorSystem, error) {
 		relocationJobs:        make(map[string]*internalpb.PeerState),
 		peerRemotingPorts:     xsync.NewMap[string, int](),
 		relocatingEndpoints:   xsync.NewTTLMap[string, types.Unit](relocationHandoffWindow),
+		departedEndpoints:    xsync.NewTTLMap[string, types.Unit](relocationQuiescenceMaxWait),
 		recentDepartures:      xsync.NewTTLMap[string, types.Unit](correlatedDepartureWindow),
 		topicActor:            nil,
 		extensions:            xsync.NewMap[string, extension.Extension](),
@@ -2258,15 +2265,10 @@ func (x *actorSystem) ActorOf(ctx context.Context, actorName string) (*PID, erro
 		return nil, gerrors.ErrActorSystemNotStarted
 	}
 
-	// user should not query system actors
 	if isSystemName(actorName) {
 		return nil, gerrors.NewErrActorNotFound(actorName)
 	}
 
-	// Fast path: local actor lookup uses only the tree's internal RWMutex.
-	// The tree reference (x.actors) is immutable after construction, so no
-	// system lock is needed. This avoids the double-lock contention that
-	// dominated SendAsync/SendSync throughput under high parallelism.
 	if pidnode, ok := x.localActor(actorName); ok {
 		pid := pidnode.value()
 		if pid.IsStopping() {
@@ -2275,42 +2277,28 @@ func (x *actorSystem) ActorOf(ctx context.Context, actorName string) (*PID, erro
 		return pid, nil
 	}
 
-	// Slow path: actor not found locally. Acquire the system lock for
-	// cluster and remote lookups which access mutable system state.
-	x.locker.RLock()
-
-	// check in the cluster
 	if x.clusterEnabled.Load() {
-		actor, err := x.cluster.GetActor(ctx, actorName)
+		actor, err := x.lookupClusterActorDuringDeparture(ctx, actorName)
 		if err != nil {
 			if errors.Is(err, cluster.ErrActorNotFound) {
 				x.logger.Warnf("actor=%s not found", actorName)
-				x.locker.RUnlock()
 				return nil, gerrors.NewErrActorNotFound(actorName)
 			}
-
-			x.locker.RUnlock()
 			return nil, fmt.Errorf("failed to fetch remote actor=%s: %w", actorName, err)
 		}
-
-		// Capture remoting before releasing the lock.
-		remoting := x.remoting
-		x.locker.RUnlock()
 
 		addr, err := addressFromActor(actor)
 		if err != nil {
 			return nil, err
 		}
-		return newRemotePID(addr, remoting), nil
+		return newRemotePID(addr, x.getRemoting()), nil
 	}
 
 	if x.remotingEnabled.Load() {
-		x.locker.RUnlock()
 		return nil, gerrors.ErrMethodCallNotAllowed
 	}
 
 	x.logger.Warnf("actor=%s not found", actorName)
-	x.locker.RUnlock()
 	return nil, gerrors.NewErrActorNotFound(actorName)
 }
 
@@ -2341,10 +2329,6 @@ func (x *actorSystem) ActorExists(ctx context.Context, actorName string) (bool, 
 		return false, gerrors.ErrActorSystemNotStarted
 	}
 
-	x.locker.RLock()
-	defer x.locker.RUnlock()
-
-	// check locally
 	if node, ok := x.localActor(actorName); ok {
 		pid := node.value()
 		if pid.IsStopping() {
@@ -2353,11 +2337,156 @@ func (x *actorSystem) ActorExists(ctx context.Context, actorName string) (bool, 
 		return true, nil
 	}
 
-	// check in the cluster
 	if x.clusterEnabled.Load() {
-		return x.cluster.ActorExists(ctx, actorName)
+		actor, err := x.lookupClusterActorDuringDeparture(ctx, actorName)
+		if err != nil {
+			if errors.Is(err, cluster.ErrActorNotFound) {
+				return false, nil
+			}
+			return false, err
+		}
+		return actor != nil, nil
 	}
 
+	return false, nil
+}
+
+// lookupClusterActorDuringDeparture keeps a registry lookup from accepting an
+// owner on a node that is known to have left. Normal lookups still fail fast;
+// retrying starts only after either the actor record points at a departed
+// endpoint or membership shows that a previously observed peer is gone.
+func (x *actorSystem) lookupClusterActorDuringDeparture(ctx context.Context, actorName string) (*internalpb.Actor, error) {
+	deadline := time.Now().Add(relocationQuiescenceMaxWait)
+	backoff := relocationHandoffMinBackoff
+	departureObserved := false
+
+	for {
+		wireActor, err := x.getCluster().GetActor(ctx, actorName)
+		if err == nil {
+			addr, parseErr := addressFromActor(wireActor)
+			if parseErr != nil {
+				return nil, parseErr
+			}
+
+			if !x.isEndpointDeparted(addr) {
+				alive, membershipErr := x.endpointAlive(ctx, addr)
+				if membershipErr != nil {
+					return nil, membershipErr
+				}
+				if alive {
+					return wireActor, nil
+				}
+			}
+			departureObserved = true
+		} else {
+			if errors.Is(err, cluster.ErrActorNotFound) {
+				return nil, err
+			}
+			if !isHandoffRetryable(err) {
+				return nil, err
+			}
+
+			if !departureObserved {
+				pending := x.departureInFlight()
+				if !pending {
+					var membershipErr error
+					pending, membershipErr = x.hasDepartedCachedPeer(ctx)
+					if membershipErr != nil {
+						return nil, err
+					}
+				}
+				if !pending {
+					return nil, err
+				}
+				departureObserved = true
+			}
+		}
+
+		if sleepWithinHandoff(ctx, backoff, deadline) {
+			backoff = min(backoff*2, relocationHandoffMaxBackoff)
+			continue
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+
+		wireActor, err = x.getCluster().GetActor(ctx, actorName)
+		if err != nil {
+			return nil, err
+		}
+
+		addr, parseErr := addressFromActor(wireActor)
+		if parseErr != nil {
+			return nil, parseErr
+		}
+
+		alive, membershipErr := x.endpointAlive(ctx, addr)
+		if membershipErr != nil {
+			return nil, membershipErr
+		}
+		if alive {
+			return wireActor, nil
+		}
+
+		proceed, releaseErr := x.releaseDepartedEntry(ctx, actorName, addr.HostPort())
+		if releaseErr != nil {
+			return nil, releaseErr
+		}
+		if !proceed {
+			deadline = time.Now().Add(relocationHandoffWindow)
+			backoff = relocationHandoffMinBackoff
+			departureObserved = false
+			continue
+		}
+
+		return nil, cluster.ErrActorNotFound
+	}
+}
+
+func (x *actorSystem) endpointAlive(ctx context.Context, addr *address.Address) (bool, error) {
+	if addr == nil {
+		return false, nil
+	}
+	if addr.Host() == x.Host() && addr.Port() == x.Port() {
+		return true, nil
+	}
+
+	peers, err := x.getCluster().Peers(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, peer := range peers {
+		if peer.Host == addr.Host() && peer.RemotingPort == addr.Port() {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// hasDepartedCachedPeer compares current membership with peers this actor
+// system previously observed. It covers the short gap where membership already
+// reports a crash but NodeLeft has not reached the actor-system event loop yet.
+func (x *actorSystem) hasDepartedCachedPeer(ctx context.Context) (bool, error) {
+	if x.peerRemotingPorts == nil || x.peerRemotingPorts.Len() == 0 {
+		return false, nil
+	}
+
+	peers, err := x.getCluster().Peers(ctx)
+	if err != nil {
+		return false, err
+	}
+
+	live := make(map[string]struct{}, len(peers)+1)
+	live[x.PeersAddress()] = struct{}{}
+	for _, peer := range peers {
+		live[peer.PeerAddress()] = struct{}{}
+	}
+
+	for _, peerAddress := range x.peerRemotingPorts.Keys() {
+		if _, ok := live[peerAddress]; !ok {
+			return true, nil
+		}
+	}
 	return false, nil
 }
 
@@ -4786,6 +4915,7 @@ func (x *actorSystem) shutdownCluster(ctx context.Context, actors []*PID, peerSt
 
 		x.peerRemotingPorts.Reset()
 		x.relocatingEndpoints.Reset()
+		x.departedEndpoints.Reset()
 		x.recentDepartures.Reset()
 	}
 	return nil

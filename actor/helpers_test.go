@@ -210,6 +210,7 @@ func newReplicationSystem(clusterMock *mockcluster.Cluster) *actorSystem {
 	}
 	sys.relocationJobs = make(map[string]*internalpb.PeerState)
 	sys.peerRemotingPorts = xsync.NewMap[string, int]()
+	sys.departedEndpoints = xsync.NewTTLMap[string, types.Unit](relocationQuiescenceMaxWait)
 	sys.recentDepartures = xsync.NewTTLMap[string, types.Unit](correlatedDepartureWindow)
 	sys.dispatcher.start()
 

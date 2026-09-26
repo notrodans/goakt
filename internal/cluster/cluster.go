@@ -1940,6 +1940,11 @@ func (x *cluster) getRecord(ctx context.Context, namespace recordNamespace, key 
 
 	resp, err := x.dmap.Get(ctx, composeKey(namespace, key))
 	if err != nil {
+		// Olric protocol conversion may replace context.DeadlineExceeded with
+		// an opaque error. The operation context remains authoritative.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		return nil, err
 	}
 	return resp.Byte()
