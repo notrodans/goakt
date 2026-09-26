@@ -60,12 +60,9 @@ const (
 	relocationNotFoundMaskWindow = 500 * time.Millisecond
 )
 
-// markEndpointRelocating opens a bounded handoff window for the remoting
-// endpoint of the node that just departed at peerAddress (a host:peersPort
-// address). It resolves the departed node's remoting port from the peer cache
-// so the recorded endpoint matches the host:port a name lookup resolves to;
-// when the port is unknown (the node was never observed alive by this node)
-// there is nothing to mask and the call is a no-op.
+// markEndpointRelocating records the remoting endpoint of a departed node for
+// two bounded purposes: the short message-handoff mask and the longer registry
+// lookup evidence used during crash recovery. Unknown peers are a no-op.
 func (x *actorSystem) markEndpointRelocating(peerAddress string) {
 	host, _, err := net.SplitHostPort(peerAddress)
 	if err != nil {
@@ -77,15 +74,13 @@ func (x *actorSystem) markEndpointRelocating(peerAddress string) {
 		return
 	}
 
-	x.relocatingEndpoints.Set(address.FormatHostPort(host, remotingPort), types.Unit{})
+	endpoint := address.FormatHostPort(host, remotingPort)
+	x.relocatingEndpoints.Set(endpoint, types.Unit{})
+	x.departedEndpoints.Set(endpoint, types.Unit{})
 }
 
-// markEndpointRecovered closes the handoff window for the remoting endpoint of
-// a node that rejoined the cluster at peerAddress. A member that restarts at
-// the same host:port within its own handoff window is healthy and reachable
-// again; leaving the mask in place would stall or refuse every name-based send
-// that resolves to it for the remainder of the window. Unresolvable addresses
-// and unknown ports mean nothing was masked, so the call is a no-op.
+// markEndpointRecovered clears both departure markers when the peer is live
+// again. Unknown peers are a no-op.
 func (x *actorSystem) markEndpointRecovered(peerAddress string) {
 	host, _, err := net.SplitHostPort(peerAddress)
 	if err != nil {
@@ -97,7 +92,25 @@ func (x *actorSystem) markEndpointRecovered(peerAddress string) {
 		return
 	}
 
-	x.relocatingEndpoints.Delete(address.FormatHostPort(host, remotingPort))
+	endpoint := address.FormatHostPort(host, remotingPort)
+	x.relocatingEndpoints.Delete(endpoint)
+	x.departedEndpoints.Delete(endpoint)
+}
+
+// isEndpointDeparted reports whether addr belongs to a node that recently left
+// and may still own stale registry records.
+func (x *actorSystem) isEndpointDeparted(addr *address.Address) bool {
+	if addr == nil || x.departedEndpoints == nil {
+		return false
+	}
+	_, ok := x.departedEndpoints.Get(address.FormatHostPort(addr.Host(), addr.Port()))
+	return ok
+}
+
+// departureInFlight reports whether any node departure is still within the
+// crash-recovery evidence window.
+func (x *actorSystem) departureInFlight() bool {
+	return x.departedEndpoints != nil && x.departedEndpoints.Active()
 }
 
 // isEndpointRelocating reports whether addr resolves to a remoting endpoint that
