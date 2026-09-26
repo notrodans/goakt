@@ -1314,7 +1314,7 @@ func NewActorSystem(name string, opts ...Option) (ActorSystem, error) {
 		relocationJobs:        make(map[string]*internalpb.PeerState),
 		peerRemotingPorts:     xsync.NewMap[string, int](),
 		relocatingEndpoints:   xsync.NewTTLMap[string, types.Unit](relocationHandoffWindow),
-		departedEndpoints:    xsync.NewTTLMap[string, types.Unit](relocationQuiescenceMaxWait),
+		departedEndpoints:     xsync.NewTTLMap[string, types.Unit](relocationQuiescenceMaxWait),
 		recentDepartures:      xsync.NewTTLMap[string, types.Unit](correlatedDepartureWindow),
 		topicActor:            nil,
 		extensions:            xsync.NewMap[string, extension.Extension](),
