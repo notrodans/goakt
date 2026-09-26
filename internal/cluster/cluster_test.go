@@ -59,6 +59,25 @@ import (
 	gtls "github.com/tochemey/goakt/v4/tls"
 )
 
+type opaqueDeadlineDMap struct {
+	olric.DMap
+}
+
+func (*opaqueDeadlineDMap) Get(ctx context.Context, _ string) (*olric.GetResponse, error) {
+	<-ctx.Done()
+	return nil, errors.New("deadline exceeded")
+}
+
+func TestGetRecordPreservesContextDeadlineIdentity(t *testing.T) {
+	cl := &cluster{
+		dmap:        &opaqueDeadlineDMap{},
+		readTimeout: 5 * time.Millisecond,
+	}
+
+	_, err := cl.getRecord(context.Background(), namespaceActors, "actor")
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+}
+
 func TestNotRunningReturnsErrEngineNotRunning(t *testing.T) {
 	ctx := context.Background()
 
