@@ -7969,33 +7969,30 @@ func TestDeriveRelocationSetFromRegistry(t *testing.T) {
 		departedRemoting    = 7000
 	)
 
-	t.Run("derives only relocatable actors and grains hosted on the departed node", func(t *testing.T) {
+	t.Run("derives relocatable records and releases ordinary non-relocatable claims", func(t *testing.T) {
 		clusterMock := mockscluster.NewCluster(t)
 		system := newReplicationSystem(clusterMock)
 		system.peerRemotingPorts.Set(departedPeerAddress, departedRemoting)
 
-		// ActorsByHost/GrainsByHost already filter to the departed node's
-		// host:port in the cluster layer, so the mock returns only records on the
-		// departed node; deriveRelocationSetFromRegistry then applies the
-		// relocatable and system-name filters.
+		staleIncarnation := uuid.NewString()
 		actors := []*internalpb.Actor{
-			// included: relocatable actor on the departed node
 			internalpb.Actor_builder{Address: address.New("worker-1", system.name, departedHost, departedRemoting).String(), Relocatable: true}.Build(),
-			// excluded: not relocatable
-			internalpb.Actor_builder{Address: address.New("worker-2", system.name, departedHost, departedRemoting).String(), Relocatable: false}.Build(),
-			// excluded: system actor
+			internalpb.Actor_builder{
+				Address:       address.New("worker-2", system.name, departedHost, departedRemoting).String(),
+				Relocatable:   false,
+				IncarnationId: staleIncarnation,
+			}.Build(),
 			internalpb.Actor_builder{Address: address.New("GoAktSystemGuardian", system.name, departedHost, departedRemoting).String(), Relocatable: true}.Build(),
 		}
 
 		grains := []*internalpb.Grain{
-			// included: grain on the departed node
 			internalpb.Grain_builder{GrainId: internalpb.GrainId_builder{Kind: "k", Name: "g1", Value: "k/g1"}.Build(), Host: departedHost, Port: departedRemoting}.Build(),
-			// excluded: system grain
 			internalpb.Grain_builder{GrainId: internalpb.GrainId_builder{Kind: "k", Name: "GoAktSystemGuardian", Value: "k/GoAktSystemGuardian"}.Build(), Host: departedHost, Port: departedRemoting}.Build(),
 		}
 
 		clusterMock.EXPECT().ActorsByHost(mock.Anything, departedHost, departedRemoting, mock.Anything).Return(actors, nil).Once()
 		clusterMock.EXPECT().GrainsByHost(mock.Anything, departedHost, departedRemoting, mock.Anything).Return(grains, nil).Once()
+		clusterMock.EXPECT().RemoveActor(mock.Anything, "worker-2", staleIncarnation).Return(nil, nil).Once()
 
 		state, ok := system.deriveRelocationSetFromRegistry(context.Background(), departedPeerAddress)
 		require.True(t, ok)
@@ -8012,6 +8009,55 @@ func TestDeriveRelocationSetFromRegistry(t *testing.T) {
 		require.Len(t, state.GetGrains(), 1)
 		_, hasG1 := state.GetGrains()["k/g1"]
 		assert.True(t, hasG1)
+	})
+
+	t.Run("keeps a non-relocatable name that was re-owned after the crash scan", func(t *testing.T) {
+		clusterMock := mockscluster.NewCluster(t)
+		system := newReplicationSystem(clusterMock)
+		system.peerRemotingPorts.Set(departedPeerAddress, departedRemoting)
+
+		staleIncarnation := uuid.NewString()
+		stale := internalpb.Actor_builder{
+			Address:       address.New("worker", system.name, departedHost, departedRemoting).String(),
+			Relocatable:   false,
+			IncarnationId: staleIncarnation,
+		}.Build()
+		reowned := internalpb.Actor_builder{
+			Address:       address.New("worker", system.name, "127.0.0.3", 7100).String(),
+			Relocatable:   false,
+			IncarnationId: uuid.NewString(),
+		}.Build()
+
+		clusterMock.EXPECT().ActorsByHost(mock.Anything, departedHost, departedRemoting, mock.Anything).Return([]*internalpb.Actor{stale}, nil).Once()
+		clusterMock.EXPECT().GrainsByHost(mock.Anything, departedHost, departedRemoting, mock.Anything).Return(nil, nil).Once()
+		clusterMock.EXPECT().RemoveActor(mock.Anything, "worker", staleIncarnation).Return(reowned, nil).Once()
+
+		state, ok := system.deriveRelocationSetFromRegistry(context.Background(), departedPeerAddress)
+		require.True(t, ok)
+		require.NotNil(t, state)
+		assert.Empty(t, state.GetActors())
+		assert.Empty(t, state.GetGrains())
+	})
+
+	t.Run("retries crash recovery when stale non-relocatable claim release fails", func(t *testing.T) {
+		clusterMock := mockscluster.NewCluster(t)
+		system := newReplicationSystem(clusterMock)
+		system.peerRemotingPorts.Set(departedPeerAddress, departedRemoting)
+
+		incarnation := uuid.NewString()
+		stale := internalpb.Actor_builder{
+			Address:       address.New("worker", system.name, departedHost, departedRemoting).String(),
+			Relocatable:   false,
+			IncarnationId: incarnation,
+		}.Build()
+
+		clusterMock.EXPECT().ActorsByHost(mock.Anything, departedHost, departedRemoting, mock.Anything).Return([]*internalpb.Actor{stale}, nil).Once()
+		clusterMock.EXPECT().GrainsByHost(mock.Anything, departedHost, departedRemoting, mock.Anything).Return(nil, nil).Once()
+		clusterMock.EXPECT().RemoveActor(mock.Anything, "worker", incarnation).Return(nil, assert.AnError).Once()
+
+		state, ok := system.deriveRelocationSetFromRegistry(context.Background(), departedPeerAddress)
+		assert.False(t, ok)
+		assert.Nil(t, state)
 	})
 
 	t.Run("returns false when a port does not fit int32", func(t *testing.T) {

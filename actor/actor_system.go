@@ -3996,10 +3996,12 @@ func (x *actorSystem) dispatchDerivedRebalance(ctx context.Context, peerAddress 
 // The returned PeerState mirrors the graceful-shutdown snapshot: Host/PeersPort
 // match the NodeLeft event's peers address so relocation bookkeeping stays keyed
 // on it, RemotingPort carries the resolved remoting port so the recreate gating
-// matches stale registry entries, and only relocatable actors are included
-// (non-relocatable actors are lost with the node by design). All matching grains
-// are included; the relocation worker filters and splits them by their own
-// relocation flags.
+// matches stale registry entries. Relocatable actors and non-relocatable
+// reliable endpoints are included for worker handling. Ordinary non-relocatable
+// actors are lost with the node by design, but their
+// incarnation-fenced name claims are withdrawn during this scan so a later spawn
+// can reuse the name. All matching grains are included; the relocation worker
+// filters and splits them by their own relocation flags.
 //
 // It returns ok=false when the remoting port cannot be resolved (the node was
 // never observed alive by this leader) or the registry scan fails, so the caller
@@ -4062,16 +4064,9 @@ func (x *actorSystem) deriveRelocationSetFromRegistry(ctx context.Context, peerA
 	// the registry, so the common case allocates nothing here.
 	var wireActors map[string]*internalpb.Actor
 
-	for _, actor := range registryActors {
-		// Only relocatable actors are recovered; the rest are lost with the
-		// node by design. A non-relocatable reliable endpoint still joins the
-		// set so the relocation worker withdraws its endpoint and controller
-		// records, which would otherwise keep the endpoint name reserved
-		// cluster-wide.
-		if !actor.GetRelocatable() && actor.GetReliableDelivery() == nil {
-			continue
-		}
+	releasedNonRelocatableClaim := false
 
+	for _, actor := range registryActors {
 		addr, perr := address.Parse(actor.GetAddress())
 		if perr != nil {
 			continue
@@ -4081,6 +4076,30 @@ func (x *actorSystem) deriveRelocationSetFromRegistry(ctx context.Context, peerA
 			continue
 		}
 
+		if !actor.GetRelocatable() && actor.GetReliableDelivery() == nil {
+			// The actor is lost with its node, but its name claim must not
+			// survive the crash. RemoveActor is incarnation-fenced, so a name
+			// already claimed by a newer actor is left untouched.
+			if actor.GetSingleton() != nil || actor.GetReliableCompanion() != nil {
+				continue
+			}
+
+			reowned, rerr := x.cluster.RemoveActor(ctx, addr.QualifiedName(), actor.GetIncarnationId())
+			if rerr != nil {
+				x.logger.Errorf("node=%s failed to release non-relocatable actor=%s owned by departed node=%s: %v", x.String(), addr.QualifiedName(), peerAddress, rerr)
+				return nil, false
+			}
+
+			releasedNonRelocatableClaim = true
+			if reowned != nil {
+				x.logger.Debugf("node=%s kept re-owned non-relocatable actor=%s while cleaning departed node=%s: current owner=%s", x.String(), addr.QualifiedName(), peerAddress, reowned.GetAddress())
+			}
+			continue
+		}
+
+		// Relocatable actors are recreated by the relocation worker. A
+		// non-relocatable reliable endpoint also joins the set so the worker
+		// withdraws its endpoint and controller records.
 		if wireActors == nil {
 			wireActors = make(map[string]*internalpb.Actor)
 		}
@@ -4106,8 +4125,13 @@ func (x *actorSystem) deriveRelocationSetFromRegistry(ctx context.Context, peerA
 	// lost with it, so its records may be unrecoverable. Surface it loudly
 	// instead of silently skipping the rebalance downstream.
 	if len(wireActors) == 0 && len(wireGrains) == 0 {
-		x.logger.Warnf("leader=%s derived an empty relocation set for crashed node=%s (remoting=%s:%d); its registry records may have been lost with it (raise the cluster replica count above 1 to make crash recovery reliable)",
-			x.String(), peerAddress, host, remotingPort)
+		if releasedNonRelocatableClaim {
+			x.logger.Infof("leader=%s released non-relocatable actor claim(s) for crashed node=%s; no relocatable records remain",
+				x.String(), peerAddress)
+		} else {
+			x.logger.Warnf("leader=%s derived an empty relocation set for crashed node=%s (remoting=%s:%d); its registry records may have been lost with it (raise the cluster replica count above 1 to make crash recovery reliable)",
+				x.String(), peerAddress, host, remotingPort)
+		}
 	} else {
 		x.logger.Infof("leader=%s derived relocation set for crashed node=%s (remoting=%s:%d): actors=%d grains=%d",
 			x.String(), peerAddress, host, remotingPort, len(wireActors), len(wireGrains))
